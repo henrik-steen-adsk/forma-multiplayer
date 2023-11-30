@@ -102,6 +102,7 @@ async function refreshState(override?: Partial<SharedState>) {
 
         // Ignore old versioned state.
         if (parsed.schemaVersion === storageSchemaVersion) {
+          console.log("got data", parsed);
           storageState.value = {
             ...parsed,
             ...override,
@@ -120,8 +121,15 @@ async function refreshState(override?: Partial<SharedState>) {
 async function startStoragePolling() {
   while (true) {
     await refreshState();
-    await writeSharedState();
-    await new Promise((resolve) => setTimeout(resolve, 5000));
+    const persistedClientState = getState().clients.find((client) => client.id === clientId);
+    if (
+      persistedClientState == null ||
+      persistedClientState.lastSeen < Date.now() - 15000 ||
+      !equal(persistedClientState, clientState.value)
+    ) {
+      await writeSharedState();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 3000));
   }
 }
 
@@ -143,6 +151,7 @@ async function writeSharedState(update?: Partial<SharedState>) {
       ),
       ...update,
     };
+    console.log("save state", storageState.value);
     await Forma.extensions.storage.setObject({
       key: storageKey,
       data: JSON.stringify(storageState.value),
