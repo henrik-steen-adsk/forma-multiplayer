@@ -207,7 +207,7 @@ effect(async () => {
     } catch (e) {
       console.error("Failed while sharing", e);
     }
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, 20));
   }
 });
 
