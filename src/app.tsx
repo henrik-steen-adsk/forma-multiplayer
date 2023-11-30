@@ -5,7 +5,7 @@ import { useCallback } from "preact/hooks";
 
 const storageSchemaVersion = 8;
 
-const offerClientId = signal<string | undefined>(undefined);
+const connectedLeaderClientId = signal<string | undefined>(undefined);
 const clientId = crypto.randomUUID();
 
 type SharedState = {
@@ -108,7 +108,7 @@ async function startStoragePolling() {
 
 async function writeSharedState(update?: Partial<SharedState>) {
   try {
-    updateClientState()
+    updateClientState();
     const prev = getState();
     storageWriteState.value = "writing";
     storageState.value = {
@@ -306,7 +306,7 @@ function createReceiverConnection() {
         answers: [
           {
             value: JSON.stringify(receiverConnection.localDescription),
-            targetClientId: offerClientId.value!,
+            targetClientId: connectedLeaderClientId.value!,
           },
         ],
       });
@@ -329,27 +329,21 @@ function createReceiverConnection() {
   return receiverConnection;
 }
 
-effect(() => {
+effect(async () => {
   const state = getState();
-  const leader = state.clients.find((client) => client.id === state.leaderClientId);
 
+  const leader = state.clients.find((client) => client.id === state.leaderClientId);
   if (!leader) return;
 
   const offer = leader.offers.find((offer) => offer.targetClientId === clientId);
-
   if (!offer) return;
-  if (offerClientId.value == leader.id) return;
 
-  offerClientId.value = leader.id;
+  if (connectedLeaderClientId.value == leader.id) return;
+  connectedLeaderClientId.value = leader.id;
 
   const receiverConnection = createReceiverConnection();
   receiverConnection.setRemoteDescription(JSON.parse(offer.value));
-  receiverConnection.createAnswer(
-    function (answerDesc) {
-      receiverConnection.setLocalDescription(answerDesc);
-    },
-    () => {},
-  );
+  receiverConnection.setLocalDescription(await receiverConnection.createAnswer());
 });
 
 async function addClientsForLeader(clients: SharedState["clients"] = []) {
