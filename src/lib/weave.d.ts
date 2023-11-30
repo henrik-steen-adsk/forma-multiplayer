@@ -1,6 +1,9 @@
 export declare module "preact/src/jsx" {
   namespace JSXInternal {
     interface IntrinsicElements {
+      "weave-input": JSX.HTMLAttributes<HTMLElement> & {
+        showlabel?: boolean;
+      };
       "weave-button": JSX.HTMLAttributes<HTMLElement> & {
         type?: "button" | "submit" | "reset";
         variant?: "outlined" | "flat" | "solid";

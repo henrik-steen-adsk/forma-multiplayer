@@ -2,6 +2,9 @@ import { effect, signal } from "@preact/signals";
 import { Forma } from "forma-embedded-view-sdk/auto";
 import { CameraState } from "forma-embedded-view-sdk/dist/internal/scene/camera";
 import { useCallback } from "preact/hooks";
+import pLimit from "p-limit";
+
+const fetchLimit = pLimit(1);
 
 const storageSchemaVersion = 8;
 
@@ -44,7 +47,7 @@ function createClientState(): SharedState["clients"][0] {
   return {
     id: clientId,
     lastSeen: Date.now(),
-    name: clientId,
+    name: clientId.slice(0, 8),
     answers: [],
     offers: [],
   };
@@ -55,6 +58,12 @@ function updateClientState(updated?: Partial<SharedState["clients"][0]>) {
     ...clientState.value,
     ...updated,
     lastSeen: Date.now(),
+  };
+  storageState.value = {
+    ...getState(),
+    clients: [...getOtherClients(getState()), clientState.value].sort((a, b) =>
+      a.id.localeCompare(b.id),
+    ),
   };
 }
 
@@ -77,33 +86,50 @@ const currentSelection = signal<string[] | undefined>(undefined);
 
 startStoragePolling();
 
-async function refreshState() {
-  try {
-    storagePollingState.value = "loading";
-    const response = await Forma.extensions.storage.getTextObject({ key: storageKey });
-    if (response) {
-      const parsed = JSON.parse(response.data) as SharedState;
-
-      // Ignore old versioned state.
-      if (parsed.schemaVersion === storageSchemaVersion) {
-        storageState.value = parsed;
-      }
-    }
-
-    storagePollingState.value = "idle";
-
-    await writeSharedState();
-  } catch (e) {
-    console.error("Polling failed", e);
-    storagePollingState.value = "failed";
+async function refreshState(override?: Partial<SharedState>) {
+  if (override) {
+    storageState.value = {
+      ...getState(),
+      ...override,
+    };
   }
+
+  await fetchLimit(async () => {
+    try {
+      storagePollingState.value = "loading";
+      const response = await Forma.extensions.storage.getTextObject({ key: storageKey });
+      if (response) {
+        const parsed = JSON.parse(response.data) as SharedState;
+
+        // Ignore old versioned state.
+        if (parsed.schemaVersion === storageSchemaVersion) {
+          storageState.value = {
+            ...parsed,
+            ...override,
+          };
+        }
+      }
+
+      storagePollingState.value = "idle";
+    } catch (e) {
+      console.error("Polling failed", e);
+      storagePollingState.value = "failed";
+    }
+  });
 }
 
 async function startStoragePolling() {
   while (true) {
     await refreshState();
+    await writeSharedState();
     await new Promise((resolve) => setTimeout(resolve, 5000));
   }
+}
+
+function getOtherClients(state: SharedState) {
+  return state.clients.filter(
+    (client) => client.id !== clientId && client.lastSeen >= Date.now() - 20000,
+  );
 }
 
 async function writeSharedState(update?: Partial<SharedState>) {
@@ -113,12 +139,9 @@ async function writeSharedState(update?: Partial<SharedState>) {
     storageWriteState.value = "writing";
     storageState.value = {
       ...prev,
-      clients: [
-        ...prev.clients.filter(
-          (client) => client.id !== clientId && client.lastSeen >= Date.now() - 20000,
-        ),
-        clientState.value,
-      ],
+      clients: [...getOtherClients(prev), clientState.value].sort((a, b) =>
+        a.id.localeCompare(b.id),
+      ),
       ...update,
     };
     await Forma.extensions.storage.setObject({
@@ -218,7 +241,7 @@ effect(async () => {
     } catch (e) {
       console.error("Failed while sharing", e);
     }
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
 });
 
@@ -289,7 +312,6 @@ async function onMessage(message: unknown) {
       await Forma.camera.move({
         position: message.cameraPosition.position,
         target: message.cameraPosition.target,
-        transitionTimeMs: 100,
       });
       break;
   }
@@ -363,10 +385,10 @@ async function addClientsForLeader(clients: SharedState["clients"] = []) {
     offers: [...clientState.value.offers, ...offers],
   });
 
-  await refreshState();
-  await writeSharedState({
+  await refreshState({
     leaderClientId: clientId,
   });
+  await writeSharedState();
 }
 
 effect(() => {
@@ -383,6 +405,8 @@ effect(() => {
   }
 });
 
+const showDebug = signal<boolean>(false);
+
 export default function App() {
   const createAndStoreOffer = useCallback(async () => {
     const clients = getState().clients.filter((client) => client.id !== clientId);
@@ -391,17 +415,45 @@ export default function App() {
 
   return (
     <>
-      <h1>Multiplayer</h1>
-      <p>Hello world!</p>
-      <button onClick={createAndStoreOffer}>Start presenting (create offer)</button>
-      <p>Storage polling state: {storagePollingState.value}</p>
-      <p>Storage writing state: {storageWriteState.value}</p>
-      <p>Client ID: {clientId}</p>
-      <pre>
-        Storage state:
-        <br />
-        {JSON.stringify(storageState.value, undefined, "  ")}
-      </pre>
+      <p style="display: flex; align-items: flex-end">
+        <weave-input
+          label="Your name"
+          showlabel
+          value={clientState.value.name}
+          onChange={(e) => {
+            updateClientState({
+              name: (e.target as HTMLInputElement).value,
+            });
+          }}
+        />
+        {getState().leaderClientId !== clientId && (
+          <weave-button onClick={createAndStoreOffer} style="margin-left: 12px">
+            Present
+          </weave-button>
+        )}
+      </p>
+      {getState().leaderClientId === clientId && <p>You are presenting!</p>}
+      <p>Participants:</p>
+      {getState().clients.map((client) => (
+        <p>
+          {client.name} {client.id === clientId && <> (you)</>}
+        </p>
+      ))}
+      <p>
+        <weave-button onClick={() => (showDebug.value = !showDebug.value)}>Debug</weave-button>
+      </p>
+      {showDebug.value && (
+        <>
+          <p>Storage polling state: {storagePollingState.value}</p>
+          <p>Storage writing state: {storageWriteState.value}</p>
+          <p>Client ID: {clientId}</p>
+          <pre>
+            Storage state:
+            <br />
+            {JSON.stringify(storageState.value, undefined, "  ")}
+          </pre>
+        </>
+      )}
     </>
   );
 }
