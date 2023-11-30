@@ -3,15 +3,52 @@ import { Forma } from "forma-embedded-view-sdk/auto";
 import { CameraState } from "forma-embedded-view-sdk/dist/internal/scene/camera";
 import { useCallback } from "preact/hooks";
 
-const storageSchemaVersion = 2;
+const storageSchemaVersion = 3;
+
+const offerClientId = signal<string | undefined>(undefined)
+const clientId = crypto.randomUUID();
 
 type SharedState = {
   schemaVersion: typeof storageSchemaVersion;
-  offer: string | undefined;
-  offerId: string | undefined;
-  answer: string | undefined;
-  answerId: string | undefined;
+  clients: {
+    id: string;
+    lastSeen: number;
+    name: string;
+    offers: {
+      value: string;
+      targetClientId: string;
+    }[];
+    answers: {
+      value: string;
+      targetClientId: string;
+    }[];
+  }[];
+  leaderClientId: string | undefined;
 };
+
+function getState(): SharedState {
+  return storageState.value ?? createBlankState();
+}
+
+function createBlankState(): SharedState {
+  return {
+    schemaVersion: storageSchemaVersion,
+    clients: [],
+    leaderClientId: undefined,
+  };
+}
+
+function updateClientState(prev: SharedState, cur: SharedState["clients"][0]) {
+  return {
+    ...prev,
+    clients: [
+      ...prev.clients.filter(
+        (client) => client.id !== clientId && client.lastSeen >= Date.now() - 60000,
+      ),
+      cur,
+    ],
+  };
+}
 
 const storageKey = "state";
 const storagePollingState = signal<"initialize" | "idle" | "loading" | "failed">("initialize");
@@ -23,7 +60,6 @@ type Message = {
   type: "cameraPosition";
   cameraPosition: CameraState;
 };
-const offerId = signal<string | undefined>(undefined);
 
 startStoragePolling();
 
@@ -72,20 +108,31 @@ const presenterConnection = new RTCPeerConnection(rtcConfiguration);
 presenterConnection.onicecandidate = function (e) {
   if (e.candidate == null) {
     console.log("presenterConnection.onicecandidate", e);
-    offerId.value = crypto.randomUUID();
-    const newState: SharedState = {
-      schemaVersion: storageSchemaVersion,
-      answer: undefined,
-      offer: JSON.stringify(presenterConnection.localDescription),
-      offerId: offerId.value,
-      answerId: undefined,
-    };
-    writeSharedState(newState);
+    writeSharedState(
+      updateClientState(
+        {
+          ...getState(),
+          leaderClientId: clientId,
+        },
+        {
+          id: clientId,
+          lastSeen: Date.now(),
+          name: clientId,
+          answers: [],
+          offers: [
+            {
+              value: JSON.stringify(presenterConnection.localDescription),
+              targetClientId: "TODO",
+            },
+          ],
+        },
+      ),
+    );
   }
 };
 
 effect(async () => {
-  while (offerId.value) {
+  while (getState().leaderClientId === clientId) {
     try {
       Forma.camera.getCurrent().then((camera) => {
         sendCameraPosition(camera);
@@ -102,7 +149,7 @@ function sendCameraPosition(cameraPosition: CameraState) {
     type: "cameraPosition",
     cameraPosition,
   };
-  if (storageState.value?.offerId === offerId.value) {
+  if (getState().leaderClientId === clientId) {
     presenterDataChannel.send(JSON.stringify(message));
   }
 }
@@ -152,14 +199,20 @@ const receiverConnection = new RTCPeerConnection(rtcConfiguration);
 receiverConnection.onicecandidate = function (e) {
   console.log(e);
   if (e.candidate == null) {
-    const newState: SharedState = {
-      schemaVersion: storageSchemaVersion,
-      answer: JSON.stringify(receiverConnection.localDescription),
-      offer: storageState.value?.offer,
-      offerId: storageState.value?.offerId,
-      answerId: storageState.value?.offerId,
-    };
-    writeSharedState(newState);
+    writeSharedState(
+      updateClientState(getState(), {
+        id: clientId,
+        lastSeen: Date.now(),
+        name: clientId,
+        answers: [
+          {
+            value: JSON.stringify(receiverConnection.localDescription),
+            targetClientId: offerClientId.value!,
+          },
+        ],
+        offers: [],
+      }),
+    );
   }
 };
 
@@ -191,28 +244,37 @@ export default function App() {
   }, []);
 
   useSignalEffect(() => {
+    const answers = getState().clients.flatMap((client) =>
+      client.answers.filter((answer) => answer.targetClientId === clientId),
+    );
+    const firstAnswer = answers[0];
+
     // Don't do anything if there is no answer matching the offer
-    if (storageState.value?.answerId !== offerId.value) {
+    if (!firstAnswer) {
       return;
     }
-    if (storageState.value?.answerId === offerId.value && storageState.value?.answer != null) {
-      console.log("setting remote description answer");
-      var answerDesc = new RTCSessionDescription(JSON.parse(storageState.value.answer));
-      presenterConnection.setRemoteDescription(answerDesc);
-      return;
-    }
+    console.log("setting remote description answer");
+    var answerDesc = new RTCSessionDescription(JSON.parse(firstAnswer.value));
+    presenterConnection.setRemoteDescription(answerDesc);
+    return;
   });
 
   const connectToOffer = () => {
-    if (storageState.value?.offer && storageState.value.offerId !== offerId.value) {
-      receiverConnection.setRemoteDescription(JSON.parse(storageState.value.offer));
-      receiverConnection.createAnswer(
-        function (answerDesc) {
-          receiverConnection.setLocalDescription(answerDesc);
-        },
-        () => {},
-      );
-    }
+    const state = getState();
+    const leader = state.clients.find((client) => client.id === state.leaderClientId);
+    const offer = leader?.offers[0];
+
+    if (leader == null || offer == null || leader.id === clientId) return;
+
+    offerClientId.value = leader.id
+
+    receiverConnection.setRemoteDescription(JSON.parse(offer.value));
+    receiverConnection.createAnswer(
+      function (answerDesc) {
+        receiverConnection.setLocalDescription(answerDesc);
+      },
+      () => {},
+    );
   };
 
   return (
@@ -223,7 +285,7 @@ export default function App() {
       <button onClick={connectToOffer}>Connect to presenter (accept offer)</button>
       <p>Storage polling state: {storagePollingState.value}</p>
       <p>Storage writing state: {storageWriteState.value}</p>
-      <p>Offer Id: {offerId.value}</p>
+      <p>Client ID: {clientId}</p>
       <pre>
         Storage state:
         <br />
