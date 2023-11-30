@@ -215,19 +215,12 @@ export default function App() {
     }
   };
 
-  const sendPresenterMessage = async () => {
-    console.log(presenterDataChannel);
-    const camera = await Forma.camera.getCurrent();
-    presenterDataChannel.send(JSON.stringify(camera));
-  };
-
   return (
     <>
       <h1>Multiplayer</h1>
       <p>Hello world!</p>
       <button onClick={createAndStoreOffer}>Start presenting (create offer)</button>
       <button onClick={connectToOffer}>Connect to presenter (accept offer)</button>
-      <button onClick={sendPresenterMessage}>Send message as presenter</button>
       <p>Storage polling state: {storagePollingState.value}</p>
       <p>Storage writing state: {storageWriteState.value}</p>
       <p>Offer Id: {offerId.value}</p>
