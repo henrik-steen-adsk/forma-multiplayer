@@ -225,39 +225,43 @@ async function onMessage(message: unknown) {
   }
 }
 
-const receiverConnection = new RTCPeerConnection(rtcConfiguration);
+function createReceiverConnection() {
+  const receiverConnection = new RTCPeerConnection(rtcConfiguration);
 
-receiverConnection.onicecandidate = function (e) {
-  console.log(e);
-  if (e.candidate == null) {
-    writeSharedState(
-      updateClientState(getState(), {
-        id: clientId,
-        lastSeen: Date.now(),
-        name: clientId,
-        answers: [
-          {
-            value: JSON.stringify(receiverConnection.localDescription),
-            targetClientId: offerClientId.value!,
-          },
-        ],
-        offers: [],
-      }),
-    );
-  }
-};
+  receiverConnection.onicecandidate = function (e) {
+    console.log(e);
+    if (e.candidate == null) {
+      writeSharedState(
+        updateClientState(getState(), {
+          id: clientId,
+          lastSeen: Date.now(),
+          name: clientId,
+          answers: [
+            {
+              value: JSON.stringify(receiverConnection.localDescription),
+              targetClientId: offerClientId.value!,
+            },
+          ],
+          offers: [],
+        }),
+      );
+    }
+  };
 
-receiverConnection.ondatachannel = function (e) {
-  var datachannel = e.channel || e;
-  const dc2 = datachannel;
-  dc2.onopen = function (e) {
-    console.log("receiver connection open");
+  receiverConnection.ondatachannel = function (e) {
+    var datachannel = e.channel || e;
+    const dc2 = datachannel;
+    dc2.onopen = function (e) {
+      console.log("receiver connection open");
+    };
+    dc2.onmessage = function (e) {
+      var data = JSON.parse(e.data);
+      onMessage(data);
+    };
   };
-  dc2.onmessage = function (e) {
-    var data = JSON.parse(e.data);
-    onMessage(data);
-  };
-};
+
+  return receiverConnection
+}
 
 export default function App() {
   const createAndStoreOffer = useCallback(() => {
@@ -284,6 +288,7 @@ export default function App() {
 
     offerClientId.value = leader.id;
 
+    const receiverConnection = createReceiverConnection()
     receiverConnection.setRemoteDescription(JSON.parse(offer.value));
     receiverConnection.createAnswer(
       function (answerDesc) {
