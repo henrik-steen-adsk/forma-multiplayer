@@ -77,41 +77,16 @@ connection.onicecandidate = function (e) {
   }
 };
 
-function shareCamera(cameraState: CameraState) {
-  console.log("TODO: Share camera state", cameraState);
-}
-async function pollCamera(): Promise<CameraState> {
-  console.log("TODO: Poll camera state");
-  const curPos = await Forma.camera.getCurrent();
-
-  return {
-    position: { x: curPos.position.x, y: curPos.position.y, z: curPos.position.z },
-    target: { x: curPos.target.x, y: curPos.target.y, z: curPos.target.z },
-    type: curPos.type,
-  };
-}
-
 effect(async () => {
-  if (isSharing.value)
-    while (true) {
-      try {
-        Forma.camera.getCurrent().then((camera) => {
-          shareCamera(camera);
-        });
-      } catch (e) {
-        console.error("Failed while sharing", e);
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
+  while (isSharing.value) {
+    try {
+      Forma.camera.getCurrent().then((camera) => {
+        sendCameraPosition(camera);
+      });
+    } catch (e) {
+      console.error("Failed while sharing", e);
     }
-  else {
-    while (true) {
-      try {
-        await Forma.camera.move(await pollCamera());
-      } catch (e) {
-        console.error("Failed while following", e);
-      }
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
 });
 
