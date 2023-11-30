@@ -135,7 +135,7 @@ const answeredClientIds: string[] = [];
 
 const presenterDataChannels: RTCDataChannel[] = [];
 
-function createPresenterConnection(targetClientId: string) {
+async function createPresenterConnection(targetClientId: string) {
   console.log("createPresenterConnection", targetClientId);
   const presenterConnection = new RTCPeerConnection(rtcConfiguration);
 
@@ -202,7 +202,8 @@ function createPresenterConnection(targetClientId: string) {
     }
   });
 
-  return presenterConnection;
+  const offer = await presenterConnection.createOffer();
+  presenterConnection.setLocalDescription(offer);
 }
 
 function sendSelection(selection: string[]) {
@@ -364,18 +365,7 @@ export default function App() {
   const createAndStoreOffer = useCallback(() => {
     const otherClients = getState().clients.filter((client) => client.id !== clientId);
     for (const client of otherClients) {
-      const presenterConnection = createPresenterConnection(client.id);
-      presenterConnection.createOffer(
-        function (desc) {
-          presenterConnection.setLocalDescription(
-            desc,
-            function () {},
-            function () {},
-          );
-        },
-        function () {},
-        {},
-      );
+      void createPresenterConnection(client.id);
     }
   }, []);
 
