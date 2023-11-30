@@ -1,4 +1,4 @@
-import { effect, signal } from "@preact/signals";
+import { effect, signal, useSignalEffect } from "@preact/signals";
 import { Forma } from "forma-embedded-view-sdk/auto";
 import { CameraState } from "forma-embedded-view-sdk/dist/internal/scene/camera";
 import { useCallback } from "preact/hooks";
@@ -8,7 +8,9 @@ const storageSchemaVersion = 2;
 type SharedState = {
   schemaVersion: typeof storageSchemaVersion;
   offer: string | undefined;
+  offerId: string | undefined;
   answer: string | undefined;
+  answerId: string | undefined;
 };
 
 const storageKey = "state";
@@ -21,6 +23,7 @@ type Message = {
   type: "cameraPosition";
   cameraPosition: CameraState;
 };
+const offerId = signal<string | undefined>(undefined);
 
 startStoragePolling();
 
@@ -64,21 +67,25 @@ async function writeSharedState(updated: SharedState) {
 const rtcConfiguration = {
   iceServers: [{ urls: "stun:stun.gmx.net" }],
 };
-const connection = new RTCPeerConnection(rtcConfiguration);
+const presenterConnection = new RTCPeerConnection(rtcConfiguration);
 
-connection.onicecandidate = function (e) {
+presenterConnection.onicecandidate = function (e) {
   if (e.candidate == null) {
+    console.log("presenterConnection.onicecandidate", e);
+    offerId.value = crypto.randomUUID();
     const newState: SharedState = {
       schemaVersion: storageSchemaVersion,
-      answer: storageState.value?.answer,
-      offer: JSON.stringify(connection.localDescription),
+      answer: undefined,
+      offer: JSON.stringify(presenterConnection.localDescription),
+      offerId: offerId.value,
+      answerId: undefined,
     };
     writeSharedState(newState);
   }
 };
 
 effect(async () => {
-  while (isSharing.value) {
+  while (offerId.value) {
     try {
       Forma.camera.getCurrent().then((camera) => {
         sendCameraPosition(camera);
@@ -95,8 +102,9 @@ function sendCameraPosition(cameraPosition: CameraState) {
     type: "cameraPosition",
     cameraPosition,
   };
-
-  console.log("TODO: send message", message);
+  if (storageState.value?.offerId === offerId.value) {
+    presenterDataChannel.send(JSON.stringify(message));
+  }
 }
 
 function isMessage(data: unknown): data is Message {
@@ -126,20 +134,52 @@ async function onMessage(message: unknown) {
   }
 }
 
+const presenterDataChannel = presenterConnection.createDataChannel("test", {});
+presenterDataChannel.onopen = function (e) {
+  console.log("presenter connection open", e);
+};
+presenterDataChannel.onmessage = function (e) {
+  console.log(e);
+  if (e.data.charCodeAt(0) == 2) {
+    return;
+  }
+  var data = JSON.parse(e.data);
+  console.log(data);
+};
+
+const receiverConnection = new RTCPeerConnection(rtcConfiguration);
+
+receiverConnection.onicecandidate = function (e) {
+  console.log(e);
+  if (e.candidate == null) {
+    const newState: SharedState = {
+      schemaVersion: storageSchemaVersion,
+      answer: JSON.stringify(receiverConnection.localDescription),
+      offer: storageState.value?.offer,
+      offerId: storageState.value?.offerId,
+      answerId: storageState.value?.offerId,
+    };
+    writeSharedState(newState);
+  }
+};
+
+receiverConnection.ondatachannel = function (e) {
+  var datachannel = e.channel || e;
+  const dc2 = datachannel;
+  dc2.onopen = function (e) {
+    console.log("receiver connection open");
+  };
+  dc2.onmessage = function (e) {
+    var data = JSON.parse(e.data);
+    onMessage(data);
+  };
+};
+
 export default function App() {
   const createAndStoreOffer = useCallback(() => {
-    const dc1 = connection.createDataChannel("test", {});
-    dc1.onopen = function (_e) {};
-    dc1.onmessage = function (e) {
-      if (e.data.charCodeAt(0) == 2) {
-        return;
-      }
-      var data = JSON.parse(e.data);
-      console.log(data);
-    };
-    connection.createOffer(
+    presenterConnection.createOffer(
       function (desc) {
-        connection.setLocalDescription(
+        presenterConnection.setLocalDescription(
           desc,
           function () {},
           function () {},
@@ -149,13 +189,48 @@ export default function App() {
       {},
     );
   }, []);
+
+  useSignalEffect(() => {
+    // Don't do anything if there is no answer matching the offer
+    if (storageState.value?.answerId !== offerId.value) {
+      return;
+    }
+    if (storageState.value?.answerId === offerId.value && storageState.value?.answer != null) {
+      console.log("setting remote description answer");
+      var answerDesc = new RTCSessionDescription(JSON.parse(storageState.value.answer));
+      presenterConnection.setRemoteDescription(answerDesc);
+      return;
+    }
+  });
+
+  const connectToOffer = () => {
+    if (storageState.value?.offer && storageState.value.offerId !== offerId.value) {
+      receiverConnection.setRemoteDescription(JSON.parse(storageState.value.offer));
+      receiverConnection.createAnswer(
+        function (answerDesc) {
+          receiverConnection.setLocalDescription(answerDesc);
+        },
+        () => {},
+      );
+    }
+  };
+
+  const sendPresenterMessage = async () => {
+    console.log(presenterDataChannel);
+    const camera = await Forma.camera.getCurrent();
+    presenterDataChannel.send(JSON.stringify(camera));
+  };
+
   return (
     <>
       <h1>Multiplayer</h1>
       <p>Hello world!</p>
       <button onClick={createAndStoreOffer}>Start presenting (create offer)</button>
+      <button onClick={connectToOffer}>Connect to presenter (accept offer)</button>
+      <button onClick={sendPresenterMessage}>Send message as presenter</button>
       <p>Storage polling state: {storagePollingState.value}</p>
       <p>Storage writing state: {storageWriteState.value}</p>
+      <p>Offer Id: {offerId.value}</p>
       <pre>
         Storage state:
         <br />
