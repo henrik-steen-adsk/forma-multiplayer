@@ -1,4 +1,4 @@
-import { effect, signal, useSignalEffect } from "@preact/signals";
+import { computed, effect, signal } from "@preact/signals";
 import { Forma } from "forma-embedded-view-sdk/auto";
 import { CameraState } from "forma-embedded-view-sdk/dist/internal/scene/camera";
 import { useCallback } from "preact/hooks";
@@ -38,6 +38,16 @@ function createBlankState(): SharedState {
   };
 }
 
+function createClientState(): SharedState["clients"][0] {
+  return {
+    id: clientId,
+    lastSeen: Date.now(),
+    name: clientId,
+    answers: [],
+    offers: [],
+  };
+}
+
 function updateClientState(prev: SharedState, cur: SharedState["clients"][0]) {
   return {
     ...prev,
@@ -55,6 +65,15 @@ const storagePollingState = signal<"initialize" | "idle" | "loading" | "failed">
 const storageWriteState = signal<"idle" | "writing" | "failed">("idle");
 const storageState = signal<SharedState | undefined>(undefined);
 const isSharing = signal<boolean>(false);
+
+const hasInited = signal(false);
+
+effect(() => {
+  if (!hasInited.value && storageState.value) {
+    void writeSharedState(updateClientState(getState(), createClientState()));
+    hasInited.value = true;
+  }
+});
 
 type Message = {
   type: "cameraPosition";
@@ -90,9 +109,9 @@ async function startStoragePolling() {
 async function writeSharedState(updated: SharedState) {
   try {
     storageWriteState.value = "writing";
+    storageState.value = updated;
     await Forma.extensions.storage.setObject({ key: storageKey, data: JSON.stringify(updated) });
     storageWriteState.value = "idle";
-    storageState.value = updated;
   } catch (e) {
     console.error("Writing failed", e);
     storageWriteState.value = "failed";
@@ -106,12 +125,17 @@ const rtcConfiguration = {
 
 const presenterDataChannels: RTCDataChannel[] = [];
 
-function createPresenterConnection() {
+function createPresenterConnection(targetClientId: string) {
+  console.log("createPresenterConnection", targetClientId);
   const presenterConnection = new RTCPeerConnection(rtcConfiguration);
 
   presenterConnection.onicecandidate = function (e) {
     if (e.candidate == null) {
       console.log("presenterConnection.onicecandidate", e);
+
+      const clientState =
+        getState().clients.find((client) => client.id === clientId) ?? createClientState();
+
       writeSharedState(
         updateClientState(
           {
@@ -119,14 +143,12 @@ function createPresenterConnection() {
             leaderClientId: clientId,
           },
           {
-            id: clientId,
-            lastSeen: Date.now(),
-            name: clientId,
-            answers: [],
+            ...clientState,
             offers: [
+              ...(clientState?.offers ?? []),
               {
                 value: JSON.stringify(presenterConnection.localDescription),
-                targetClientId: "TODO",
+                targetClientId,
               },
             ],
           },
@@ -260,50 +282,56 @@ function createReceiverConnection() {
     };
   };
 
-  return receiverConnection
+  return receiverConnection;
 }
+
+effect(() => {
+  const state = getState();
+  const leader = state.clients.find((client) => client.id === state.leaderClientId);
+
+  if (!leader) return;
+
+  const offer = leader.offers.find((offer) => offer.targetClientId === clientId);
+
+  if (!offer) return;
+  if (offerClientId.value == leader.id) return;
+
+  offerClientId.value = leader.id;
+
+  const receiverConnection = createReceiverConnection();
+  receiverConnection.setRemoteDescription(JSON.parse(offer.value));
+  receiverConnection.createAnswer(
+    function (answerDesc) {
+      receiverConnection.setLocalDescription(answerDesc);
+    },
+    () => {},
+  );
+});
 
 export default function App() {
   const createAndStoreOffer = useCallback(() => {
-    const presenterConnection = createPresenterConnection();
-    presenterConnection.createOffer(
-      function (desc) {
-        presenterConnection.setLocalDescription(
-          desc,
-          function () {},
-          function () {},
-        );
-      },
-      function () {},
-      {},
-    );
+    const otherClients = getState().clients.filter((client) => client.id !== clientId);
+    for (const client of otherClients) {
+      const presenterConnection = createPresenterConnection(client.id);
+      presenterConnection.createOffer(
+        function (desc) {
+          presenterConnection.setLocalDescription(
+            desc,
+            function () {},
+            function () {},
+          );
+        },
+        function () {},
+        {},
+      );
+    }
   }, []);
-
-  const connectToOffer = () => {
-    const state = getState();
-    const leader = state.clients.find((client) => client.id === state.leaderClientId);
-    const offer = leader?.offers[0];
-
-    if (leader == null || offer == null || leader.id === clientId) return;
-
-    offerClientId.value = leader.id;
-
-    const receiverConnection = createReceiverConnection()
-    receiverConnection.setRemoteDescription(JSON.parse(offer.value));
-    receiverConnection.createAnswer(
-      function (answerDesc) {
-        receiverConnection.setLocalDescription(answerDesc);
-      },
-      () => {},
-    );
-  };
 
   return (
     <>
       <h1>Multiplayer</h1>
       <p>Hello world!</p>
       <button onClick={createAndStoreOffer}>Start presenting (create offer)</button>
-      <button onClick={connectToOffer}>Connect to presenter (accept offer)</button>
       <p>Storage polling state: {storagePollingState.value}</p>
       <p>Storage writing state: {storageWriteState.value}</p>
       <p>Client ID: {clientId}</p>
