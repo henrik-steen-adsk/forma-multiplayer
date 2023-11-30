@@ -50,19 +50,11 @@ function createClientState(): SharedState["clients"][0] {
   };
 }
 
-function updateClientState(prev: SharedState, cur: SharedState["clients"][0]) {
-  clientState.value = cur;
-  return {
-    ...prev,
-    clients: [
-      ...prev.clients.filter(
-        (client) => client.id !== clientId && client.lastSeen >= Date.now() - 20000,
-      ),
-      {
-        ...cur,
-        lastSeen: Date.now(),
-      },
-    ],
+function updateClientState(updated?: Partial<SharedState["clients"][0]>) {
+  clientState.value = {
+    ...clientState.value,
+    ...updated,
+    lastSeen: Date.now(),
   };
 }
 
@@ -100,7 +92,7 @@ async function refreshState() {
 
     storagePollingState.value = "idle";
 
-    await writeSharedState(updateClientState(getState(), clientState.value));
+    await writeSharedState();
   } catch (e) {
     console.error("Polling failed", e);
     storagePollingState.value = "failed";
@@ -114,11 +106,25 @@ async function startStoragePolling() {
   }
 }
 
-async function writeSharedState(updated: SharedState) {
+async function writeSharedState(update?: Partial<SharedState>) {
   try {
+    updateClientState()
+    const prev = getState();
     storageWriteState.value = "writing";
-    storageState.value = updated;
-    await Forma.extensions.storage.setObject({ key: storageKey, data: JSON.stringify(updated) });
+    storageState.value = {
+      ...prev,
+      clients: [
+        ...prev.clients.filter(
+          (client) => client.id !== clientId && client.lastSeen >= Date.now() - 20000,
+        ),
+        clientState.value,
+      ],
+      ...update,
+    };
+    await Forma.extensions.storage.setObject({
+      key: storageKey,
+      data: JSON.stringify(storageState.value),
+    });
     storageWriteState.value = "idle";
   } catch (e) {
     console.error("Writing failed", e);
@@ -138,33 +144,6 @@ const presenterDataChannels: RTCDataChannel[] = [];
 async function createPresenterConnection(targetClientId: string) {
   console.log("createPresenterConnection", targetClientId);
   const presenterConnection = new RTCPeerConnection(rtcConfiguration);
-
-  presenterConnection.onicecandidate = async function (e) {
-    if (e.candidate == null) {
-      console.log("presenterConnection.onicecandidate", e);
-
-      await refreshState();
-
-      await writeSharedState(
-        updateClientState(
-          {
-            ...getState(),
-            leaderClientId: clientId,
-          },
-          {
-            ...clientState.value,
-            offers: [
-              ...(clientState.value.offers ?? []),
-              {
-                value: JSON.stringify(presenterConnection.localDescription),
-                targetClientId,
-              },
-            ],
-          },
-        ),
-      );
-    }
-  };
 
   const presenterDataChannel = presenterConnection.createDataChannel("test", {});
   presenterDataChannel.onopen = function (e) {
@@ -204,6 +183,10 @@ async function createPresenterConnection(targetClientId: string) {
 
   const offer = await presenterConnection.createOffer();
   presenterConnection.setLocalDescription(offer);
+
+  return {
+    offer,
+  };
 }
 
 function sendSelection(selection: string[]) {
@@ -319,17 +302,15 @@ function createReceiverConnection() {
     console.log(e);
     if (e.candidate == null) {
       await refreshState();
-      await writeSharedState(
-        updateClientState(getState(), {
-          ...clientState.value,
-          answers: [
-            {
-              value: JSON.stringify(receiverConnection.localDescription),
-              targetClientId: offerClientId.value!,
-            },
-          ],
-        }),
-      );
+      updateClientState({
+        answers: [
+          {
+            value: JSON.stringify(receiverConnection.localDescription),
+            targetClientId: offerClientId.value!,
+          },
+        ],
+      });
+      await writeSharedState();
     }
   };
 
@@ -371,12 +352,47 @@ effect(() => {
   );
 });
 
+async function addClientsForLeader(clients: SharedState["clients"] = []) {
+  const offers: SharedState["clients"][0]["offers"] = [];
+  for (const client of clients) {
+    console.log("Add client", client.id);
+
+    const { offer } = await createPresenterConnection(client.id);
+    offers.push({
+      value: JSON.stringify(offer),
+      targetClientId: client.id,
+    });
+  }
+
+  updateClientState({
+    ...clientState.value,
+    offers: [...clientState.value.offers, ...offers],
+  });
+
+  await refreshState();
+  await writeSharedState({
+    leaderClientId: clientId,
+  });
+}
+
+effect(() => {
+  if (getState().leaderClientId !== clientId) return;
+
+  const existingOffersTo = clientState.value.offers.map((offer) => offer.targetClientId);
+
+  const clients = getState().clients.filter(
+    (client) => client.id !== clientId && !existingOffersTo.includes(client.id),
+  );
+
+  if (clients.length > 0) {
+    addClientsForLeader(clients);
+  }
+});
+
 export default function App() {
-  const createAndStoreOffer = useCallback(() => {
-    const otherClients = getState().clients.filter((client) => client.id !== clientId);
-    for (const client of otherClients) {
-      void createPresenterConnection(client.id);
-    }
+  const createAndStoreOffer = useCallback(async () => {
+    const clients = getState().clients.filter((client) => client.id !== clientId);
+    addClientsForLeader(clients);
   }, []);
 
   return (
