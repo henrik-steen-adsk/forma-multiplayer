@@ -1,7 +1,7 @@
-import { signal, effect } from "@preact/signals";
+import { effect, signal } from "@preact/signals";
 import { Forma } from "forma-embedded-view-sdk/auto";
-import { useCallback } from "preact/hooks";
 import { CameraState } from "forma-embedded-view-sdk/dist/internal/scene/camera";
+import { useCallback } from "preact/hooks";
 
 const storageSchemaVersion = 2;
 
@@ -16,6 +16,11 @@ const storagePollingState = signal<"initialize" | "idle" | "loading" | "failed">
 const storageWriteState = signal<"idle" | "writing" | "failed">("idle");
 const storageState = signal<SharedState | undefined>(undefined);
 const isSharing = signal<boolean>(false);
+
+type Message = {
+  type: "cameraPosition";
+  cameraPosition: CameraState;
+};
 
 startStoragePolling();
 
@@ -109,6 +114,37 @@ effect(async () => {
     }
   }
 });
+
+function sendCameraPosition(cameraPosition: CameraState) {
+  const message: Message = {
+    type: "cameraPosition",
+    cameraPosition,
+  };
+
+  console.log("TODO: send message", message);
+}
+
+function isMessage(data: unknown): data is Message {
+  return data != null && typeof data === "object" && "type" in data;
+}
+
+function onMessage(message: unknown) {
+  if (!isMessage(message)) {
+    console.error("Unexpected message", message);
+    return;
+  }
+
+  switch (message.type) {
+    case "cameraPosition":
+      // TODO: switch perspective
+      void Forma.camera.move({
+        position: message.cameraPosition.position,
+        target: message.cameraPosition.target,
+      });
+      break;
+  }
+}
+
 export default function App() {
   const createAndStoreOffer = useCallback(() => {
     const dc1 = connection.createDataChannel("test", {});
