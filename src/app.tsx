@@ -1,8 +1,9 @@
-import { effect, signal } from "@preact/signals";
+import { computed, effect, signal } from "@preact/signals";
 import { Forma } from "forma-embedded-view-sdk/auto";
 import { CameraState } from "forma-embedded-view-sdk/dist/internal/scene/camera";
 import { useCallback } from "preact/hooks";
 import pLimit from "p-limit";
+import equal from "fast-deep-equal";
 
 const fetchLimit = pLimit(1);
 
@@ -81,8 +82,6 @@ type Message =
       type: "selectionPaths";
       selection: string[];
     };
-
-const currentSelection = signal<string[] | undefined>(undefined);
 
 startStoragePolling();
 
@@ -212,53 +211,92 @@ async function createPresenterConnection(targetClientId: string) {
   };
 }
 
-function sendSelection(selection: string[]) {
-  if (selection == currentSelection.value) return;
-  const message: Message = {
-    type: "selectionPaths",
-    selection,
-  };
-  for (const presenterDataChannel of presenterDataChannels) {
+let lastSentCameraPosition:
+  | {
+      value: CameraState;
+      time: number;
+    }
+  | undefined;
+let lastSentSelection:
+  | {
+      value: string[];
+      time: number;
+    }
+  | undefined;
+let activeSender: symbol | undefined;
+
+async function startCameraPositionSending(sender: symbol) {
+  while (activeSender === sender) {
     try {
-      if (presenterDataChannel.readyState === "open") {
-        presenterDataChannel.send(JSON.stringify(message));
+      const cameraPosition = await Forma.camera.getCurrent();
+      if (
+        lastSentCameraPosition == null ||
+        !equal(lastSentCameraPosition.value, cameraPosition) ||
+        lastSentCameraPosition.time < performance.now() - 4000
+      ) {
+        lastSentCameraPosition = {
+          value: cameraPosition,
+          time: performance.now(),
+        };
+        broadcast({
+          type: "cameraPosition",
+          cameraPosition,
+        });
       }
     } catch (e) {
-      console.error("Failed to send message", e);
+      console.error("Failed while sending camera position", e);
     }
+    await new Promise((resolve) => setTimeout(resolve, 16));
   }
 }
 
-effect(async () => {
-  while (getState().leaderClientId === clientId) {
+async function startSelectionSending(sender: symbol) {
+  while (activeSender === sender) {
     try {
-      Forma.camera.getCurrent().then((camera) => {
-        sendCameraPosition(camera);
-      });
-      Forma.selection.getSelection().then((selection) => {
-        sendSelection(selection);
-      });
+      const selection = await Forma.selection.getSelection();
+      if (
+        lastSentSelection == null ||
+        !equal(lastSentSelection.value, selection) ||
+        lastSentSelection.time < performance.now() - 4000
+      ) {
+        lastSentSelection = {
+          value: selection,
+          time: performance.now(),
+        };
+        broadcast({
+          type: "selectionPaths",
+          selection,
+        });
+      }
     } catch (e) {
-      console.error("Failed while sharing", e);
+      console.error("Failed while sending selection", e);
     }
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+}
+
+effect(() => {
+  const shouldBeSending = getState().leaderClientId === clientId;
+  if (!shouldBeSending && activeSender) {
+    activeSender = undefined;
+  }
+  if (shouldBeSending && !activeSender) {
+    activeSender = Symbol();
+    void startCameraPositionSending(activeSender);
+    void startSelectionSending(activeSender);
   }
 });
 
-function sendCameraPosition(cameraPosition: CameraState) {
-  const message: Message = {
-    type: "cameraPosition",
-    cameraPosition,
-  };
-  if (getState().leaderClientId === clientId) {
-    for (const presenterDataChannel of presenterDataChannels) {
-      try {
-        if (presenterDataChannel.readyState === "open") {
-          presenterDataChannel.send(JSON.stringify(message));
-        }
-      } catch (e) {
-        console.error("Failed to send message", e);
+function broadcast(message: Message) {
+  console.log("send", message);
+  const serialized = JSON.stringify(message);
+  for (const channel of presenterDataChannels) {
+    try {
+      if (channel.readyState === "open") {
+        channel.send(serialized);
       }
+    } catch (e) {
+      console.error("Failed to send message", e);
     }
   }
 }
@@ -267,12 +305,18 @@ function isMessage(data: unknown): data is Message {
   return data != null && typeof data === "object" && "type" in data;
 }
 
-const _appendBuffer = function (buffer1: Float32Array, buffer2: Float32Array) {
-  const tmp = new Float32Array(buffer1.length + buffer2.length);
-  tmp.set(new Float32Array(buffer1), 0);
-  tmp.set(new Float32Array(buffer2), buffer1.length);
-  return tmp;
-};
+function concatFloat32Arrays(items: Float32Array[]) {
+  const length = items.reduce((acc, cur) => acc + cur.length, 0);
+  const result = new Float32Array(length);
+
+  let offset = 0;
+  for (const item of items) {
+    result.set(item, offset);
+    offset += item.length;
+  }
+
+  return result;
+}
 
 async function onMessage(message: unknown) {
   if (!isMessage(message)) {
@@ -287,7 +331,7 @@ async function onMessage(message: unknown) {
           return Forma.geometry.getTriangles({ path });
         }),
       );
-      const triangles = tris.reduce((acc, val) => _appendBuffer(acc, val), new Float32Array(0));
+      const triangles = concatFloat32Arrays(tris);
 
       const color = new Uint8Array((triangles.length / 3) * 4);
       for (let i = 0; i < color.length; i += 4) {
@@ -296,7 +340,7 @@ async function onMessage(message: unknown) {
         color[i + 2] = 0;
         color[i + 3] = 255;
       }
-      Forma.render.updateMesh({
+      await Forma.render.updateMesh({
         id: "selection",
         geometryData: { position: triangles, color },
       });
@@ -318,16 +362,15 @@ async function onMessage(message: unknown) {
 }
 
 function createReceiverConnection() {
-  const receiverConnection = new RTCPeerConnection(rtcConfiguration);
+  const connection = new RTCPeerConnection(rtcConfiguration);
 
-  receiverConnection.onicecandidate = async function (e) {
-    console.log(e);
+  connection.onicecandidate = async function (e) {
     if (e.candidate == null) {
       await refreshState();
       updateClientState({
         answers: [
           {
-            value: JSON.stringify(receiverConnection.localDescription),
+            value: JSON.stringify(connection.localDescription),
             targetClientId: connectedLeaderClientId.value!,
           },
         ],
@@ -336,7 +379,7 @@ function createReceiverConnection() {
     }
   };
 
-  receiverConnection.ondatachannel = function (e) {
+  connection.ondatachannel = function (e) {
     var datachannel = e.channel || e;
     const dc2 = datachannel;
     dc2.onopen = function () {
@@ -348,7 +391,7 @@ function createReceiverConnection() {
     };
   };
 
-  return receiverConnection;
+  return connection;
 }
 
 effect(async () => {
@@ -407,12 +450,12 @@ effect(() => {
 
 const showDebug = signal<boolean>(false);
 
-export default function App() {
-  const createAndStoreOffer = useCallback(async () => {
-    const clients = getState().clients.filter((client) => client.id !== clientId);
-    addClientsForLeader(clients);
-  }, []);
+function startPresent() {
+  const clients = getState().clients.filter((client) => client.id !== clientId);
+  addClientsForLeader(clients);
+}
 
+export default function App() {
   return (
     <>
       <p style="display: flex; align-items: flex-end">
@@ -427,7 +470,7 @@ export default function App() {
           }}
         />
         {getState().leaderClientId !== clientId && (
-          <weave-button onClick={createAndStoreOffer} style="margin-left: 12px">
+          <weave-button onClick={startPresent} style="margin-left: 12px">
             Present
           </weave-button>
         )}
