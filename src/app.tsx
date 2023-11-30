@@ -1,6 +1,7 @@
-import { signal } from "@preact/signals";
+import { signal, effect } from "@preact/signals";
 import { Forma } from "forma-embedded-view-sdk/auto";
 import { useCallback } from "preact/hooks";
+import { CameraState } from "forma-embedded-view-sdk/dist/internal/scene/camera";
 
 const storageSchemaVersion = 2;
 
@@ -14,6 +15,7 @@ const storageKey = "state";
 const storagePollingState = signal<"initialize" | "idle" | "loading" | "failed">("initialize");
 const storageWriteState = signal<"idle" | "writing" | "failed">("idle");
 const storageState = signal<SharedState | undefined>(undefined);
+const isSharing = signal<boolean>(false);
 
 startStoragePolling();
 
@@ -69,10 +71,48 @@ connection.onicecandidate = function (e) {
     writeSharedState(newState);
   }
 };
+
+function shareCamera(cameraState: CameraState) {
+  console.log("TODO: Share camera state", cameraState);
+}
+async function pollCamera(): Promise<CameraState> {
+  console.log("TODO: Poll camera state");
+  const curPos = await Forma.camera.getCurrent();
+
+  return {
+    position: { x: curPos.position.x, y: curPos.position.y, z: curPos.position.z },
+    target: { x: curPos.target.x, y: curPos.target.y, z: curPos.target.z },
+    type: curPos.type,
+  };
+}
+
+effect(async () => {
+  if (isSharing.value)
+    while (true) {
+      try {
+        Forma.camera.getCurrent().then((camera) => {
+          shareCamera(camera);
+        });
+      } catch (e) {
+        console.error("Failed while sharing", e);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  else {
+    while (true) {
+      try {
+        await Forma.camera.move(await pollCamera());
+      } catch (e) {
+        console.error("Failed while following", e);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+});
 export default function App() {
   const createAndStoreOffer = useCallback(() => {
     const dc1 = connection.createDataChannel("test", {});
-    dc1.onopen = function (e) {};
+    dc1.onopen = function (_e) {};
     dc1.onmessage = function (e) {
       if (e.data.charCodeAt(0) == 2) {
         return;
