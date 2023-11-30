@@ -71,10 +71,17 @@ const storagePollingState = signal<"initialize" | "idle" | "loading" | "failed">
 const storageWriteState = signal<"idle" | "writing" | "failed">("idle");
 const storageState = signal<SharedState | undefined>(undefined);
 
-type Message = {
-  type: "cameraPosition";
-  cameraPosition: CameraState;
-};
+type Message =
+  | {
+      type: "cameraPosition";
+      cameraPosition: CameraState;
+    }
+  | {
+      type: "selectionPaths";
+      selection: string[];
+    };
+
+const currentSelection = signal<string[] | undefined>(undefined);
 
 startStoragePolling();
 
@@ -198,11 +205,31 @@ function createPresenterConnection(targetClientId: string) {
   return presenterConnection;
 }
 
+function sendSelection(selection: string[]) {
+  if (selection == currentSelection.value) return;
+  const message: Message = {
+    type: "selectionPaths",
+    selection,
+  };
+  for (const presenterDataChannel of presenterDataChannels) {
+    try {
+      if (presenterDataChannel.readyState === "open") {
+        presenterDataChannel.send(JSON.stringify(message));
+      }
+    } catch (e) {
+      console.error("Failed to send message", e);
+    }
+  }
+}
+
 effect(async () => {
   while (getState().leaderClientId === clientId) {
     try {
       Forma.camera.getCurrent().then((camera) => {
         sendCameraPosition(camera);
+      });
+      Forma.selection.getSelection().then((selection) => {
+        sendSelection(selection);
       });
     } catch (e) {
       console.error("Failed while sharing", e);
@@ -240,6 +267,23 @@ async function onMessage(message: unknown) {
   }
 
   switch (message.type) {
+    case "selectionPaths":
+      for (const path of message.selection) {
+        Forma.geometry.getTriangles({ path }).then((triangles) => {
+          const color = new Uint8Array((triangles.length / 3) * 4);
+          for (let i = 0; i < color.length; i += 4) {
+            color[i] = 255;
+            color[i + 1] = 0;
+            color[i + 2] = 0;
+            color[i + 3] = 255;
+          }
+          Forma.render.updateMesh({
+            id: "selection",
+            geometryData: { position: triangles, color },
+          });
+        });
+      }
+      break;
     case "cameraPosition":
       const currentCameraState = await Forma.camera.getCurrent();
       if (currentCameraState.type !== message.cameraPosition.type) {
