@@ -1,13 +1,13 @@
-import WebRtcChat from "./components/WebRtcChat";
 import { signal } from "@preact/signals";
 import { Forma } from "forma-embedded-view-sdk/auto";
+import { useCallback } from "preact/hooks";
 
-const storageSchemaVersion = 1;
+const storageSchemaVersion = 2;
 
 type SharedState = {
   schemaVersion: typeof storageSchemaVersion;
-  count: number;
-  // TODO: add stuff here, consider bumping version above
+  offer: string | undefined;
+  answer: string | undefined;
 };
 
 const storageKey = "state";
@@ -53,12 +53,50 @@ async function writeSharedState(updated: SharedState) {
     throw e;
   }
 }
+
+const rtcConfiguration = {
+  iceServers: [{ urls: "stun:stun.gmx.net" }],
+};
+const connection = new RTCPeerConnection(rtcConfiguration);
+
+connection.onicecandidate = function (e) {
+  if (e.candidate == null) {
+    const newState: SharedState = {
+      schemaVersion: storageSchemaVersion,
+      answer: storageState.value?.answer,
+      offer: JSON.stringify(connection.localDescription),
+    };
+    writeSharedState(newState);
+  }
+};
 export default function App() {
+  const createAndStoreOffer = useCallback(() => {
+    const dc1 = connection.createDataChannel("test", {});
+    dc1.onopen = function (e) {};
+    dc1.onmessage = function (e) {
+      if (e.data.charCodeAt(0) == 2) {
+        return;
+      }
+      var data = JSON.parse(e.data);
+      console.log(data);
+    };
+    connection.createOffer(
+      function (desc) {
+        connection.setLocalDescription(
+          desc,
+          function () {},
+          function () {},
+        );
+      },
+      function () {},
+      {},
+    );
+  }, []);
   return (
     <>
       <h1>Multiplayer</h1>
       <p>Hello world!</p>
-      <WebRtcChat />
+      <button onClick={createAndStoreOffer}>Start presenting (create offer)</button>
       <p>Storage polling state: {storagePollingState.value}</p>
       <p>Storage writing state: {storageWriteState.value}</p>
       <pre>
@@ -66,16 +104,6 @@ export default function App() {
         <br />
         {JSON.stringify(storageState.value, undefined, "  ")}
       </pre>
-      <button
-        onClick={async () => {
-          await writeSharedState({
-            schemaVersion: storageSchemaVersion,
-            count: (storageState.value?.count ?? 0) + 1,
-          });
-        }}
-      >
-        Write some state
-      </button>
     </>
   );
 }
