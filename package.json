@@ -11,6 +11,7 @@
     "prettier:write": "yarn prettier --write src"
   },
   "dependencies": {
+    "@preact/signals": "^1.2.2",
     "file-saver": "^2.0.5",
     "forma-embedded-view-sdk": "^0.36.0",
     "jszip": "3.10.1",
