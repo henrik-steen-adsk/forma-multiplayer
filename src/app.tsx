@@ -261,6 +261,13 @@ function isMessage(data: unknown): data is Message {
   return data != null && typeof data === "object" && "type" in data;
 }
 
+const _appendBuffer = function (buffer1: Float32Array, buffer2: Float32Array) {
+  const tmp = new Float32Array(buffer1.length + buffer2.length);
+  tmp.set(new Float32Array(buffer1), 0);
+  tmp.set(new Float32Array(buffer2), buffer1.length);
+  return tmp;
+};
+
 async function onMessage(message: unknown) {
   if (!isMessage(message)) {
     console.error("Unexpected message", message);
@@ -269,21 +276,24 @@ async function onMessage(message: unknown) {
 
   switch (message.type) {
     case "selectionPaths":
-      for (const path of message.selection) {
-        Forma.geometry.getTriangles({ path }).then((triangles) => {
-          const color = new Uint8Array((triangles.length / 3) * 4);
-          for (let i = 0; i < color.length; i += 4) {
-            color[i] = 255;
-            color[i + 1] = 0;
-            color[i + 2] = 0;
-            color[i + 3] = 255;
-          }
-          Forma.render.updateMesh({
-            id: "selection",
-            geometryData: { position: triangles, color },
-          });
-        });
+      const tris = await Promise.all(
+        message.selection.map((path) => {
+          return Forma.geometry.getTriangles({ path });
+        }),
+      );
+      const triangles = tris.reduce((acc, val) => _appendBuffer(acc, val), new Float32Array(0));
+
+      const color = new Uint8Array((triangles.length / 3) * 4);
+      for (let i = 0; i < color.length; i += 4) {
+        color[i] = 255;
+        color[i + 1] = 0;
+        color[i + 2] = 0;
+        color[i + 3] = 255;
       }
+      Forma.render.updateMesh({
+        id: "selection",
+        geometryData: { position: triangles, color },
+      });
       break;
     case "cameraPosition":
       const currentCameraState = await Forma.camera.getCurrent();
