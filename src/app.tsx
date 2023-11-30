@@ -1,9 +1,9 @@
-import { computed, effect, signal } from "@preact/signals";
+import { effect, signal } from "@preact/signals";
 import { Forma } from "forma-embedded-view-sdk/auto";
 import { CameraState } from "forma-embedded-view-sdk/dist/internal/scene/camera";
 import { useCallback } from "preact/hooks";
 
-const storageSchemaVersion = 3;
+const storageSchemaVersion = 8;
 
 const offerClientId = signal<string | undefined>(undefined);
 const clientId = crypto.randomUUID();
@@ -25,6 +25,8 @@ type SharedState = {
   }[];
   leaderClientId: string | undefined;
 };
+
+const clientState = signal<SharedState["clients"][0]>(createClientState());
 
 function getState(): SharedState {
   return storageState.value ?? createBlankState();
@@ -49,13 +51,17 @@ function createClientState(): SharedState["clients"][0] {
 }
 
 function updateClientState(prev: SharedState, cur: SharedState["clients"][0]) {
+  clientState.value = cur;
   return {
     ...prev,
     clients: [
       ...prev.clients.filter(
-        (client) => client.id !== clientId && client.lastSeen >= Date.now() - 60000,
+        (client) => client.id !== clientId && client.lastSeen >= Date.now() - 20000,
       ),
-      cur,
+      {
+        ...cur,
+        lastSeen: Date.now(),
+      },
     ],
   };
 }
@@ -66,15 +72,6 @@ const storageWriteState = signal<"idle" | "writing" | "failed">("idle");
 const storageState = signal<SharedState | undefined>(undefined);
 const isSharing = signal<boolean>(false);
 
-const hasInited = signal(false);
-
-effect(() => {
-  if (!hasInited.value && storageState.value) {
-    void writeSharedState(updateClientState(getState(), createClientState()));
-    hasInited.value = true;
-  }
-});
-
 type Message = {
   type: "cameraPosition";
   cameraPosition: CameraState;
@@ -82,26 +79,31 @@ type Message = {
 
 startStoragePolling();
 
-async function startStoragePolling() {
-  while (true) {
-    try {
-      storagePollingState.value = "loading";
-      const response = await Forma.extensions.storage.getTextObject({ key: storageKey });
-      if (response) {
-        const parsed = JSON.parse(response.data) as SharedState;
+async function refreshState() {
+  try {
+    storagePollingState.value = "loading";
+    const response = await Forma.extensions.storage.getTextObject({ key: storageKey });
+    if (response) {
+      const parsed = JSON.parse(response.data) as SharedState;
 
-        // Ignore old versioned state.
-        if (parsed.schemaVersion === storageSchemaVersion) {
-          storageState.value = parsed;
-        }
+      // Ignore old versioned state.
+      if (parsed.schemaVersion === storageSchemaVersion) {
+        storageState.value = parsed;
       }
-
-      storagePollingState.value = "idle";
-    } catch (e) {
-      console.error("Polling failed", e);
-      storagePollingState.value = "failed";
     }
 
+    storagePollingState.value = "idle";
+
+    await writeSharedState(updateClientState(getState(), clientState.value));
+  } catch (e) {
+    console.error("Polling failed", e);
+    storagePollingState.value = "failed";
+  }
+}
+
+async function startStoragePolling() {
+  while (true) {
+    await refreshState();
     await new Promise((resolve) => setTimeout(resolve, 5000));
   }
 }
@@ -123,29 +125,30 @@ const rtcConfiguration = {
   iceServers: [{ urls: "stun:stun.gmx.net" }],
 };
 
+const answeredClientIds: string[] = [];
+
 const presenterDataChannels: RTCDataChannel[] = [];
 
 function createPresenterConnection(targetClientId: string) {
   console.log("createPresenterConnection", targetClientId);
   const presenterConnection = new RTCPeerConnection(rtcConfiguration);
 
-  presenterConnection.onicecandidate = function (e) {
+  presenterConnection.onicecandidate = async function (e) {
     if (e.candidate == null) {
       console.log("presenterConnection.onicecandidate", e);
 
-      const clientState =
-        getState().clients.find((client) => client.id === clientId) ?? createClientState();
+      await refreshState();
 
-      writeSharedState(
+      await writeSharedState(
         updateClientState(
           {
             ...getState(),
             leaderClientId: clientId,
           },
           {
-            ...clientState,
+            ...clientState.value,
             offers: [
-              ...(clientState?.offers ?? []),
+              ...(clientState.value.offers ?? []),
               {
                 value: JSON.stringify(presenterConnection.localDescription),
                 targetClientId,
@@ -173,19 +176,24 @@ function createPresenterConnection(targetClientId: string) {
   presenterDataChannels.push(presenterDataChannel);
 
   effect(() => {
-    const answers = getState().clients.flatMap((client) =>
-      client.answers.filter((answer) => answer.targetClientId === clientId),
-    );
-    const firstAnswer = answers[0];
+    const answers = getState()
+      .clients.filter((client) => client.id === targetClientId)
+      .flatMap((client) =>
+        client.answers
+          .filter((answer) => answer.targetClientId === clientId)
+          .map((answer) => ({
+            answer,
+            client,
+          })),
+      );
 
-    // Don't do anything if there is no answer matching the offer
-    if (!firstAnswer) {
-      return;
+    for (const { answer, client } of answers) {
+      if (answeredClientIds.includes(client.id)) continue;
+      console.log("setting remote description answer");
+      var answerDesc = new RTCSessionDescription(JSON.parse(answer.value));
+      presenterConnection.setRemoteDescription(answerDesc);
+      answeredClientIds.push(client.id);
     }
-    console.log("setting remote description answer");
-    var answerDesc = new RTCSessionDescription(JSON.parse(firstAnswer.value));
-    presenterConnection.setRemoteDescription(answerDesc);
-    return;
   });
 
   return presenterConnection;
@@ -212,7 +220,9 @@ function sendCameraPosition(cameraPosition: CameraState) {
   if (getState().leaderClientId === clientId) {
     for (const presenterDataChannel of presenterDataChannels) {
       try {
-        presenterDataChannel.send(JSON.stringify(message));
+        if (presenterDataChannel.readyState === "open") {
+          presenterDataChannel.send(JSON.stringify(message));
+        }
       } catch (e) {
         console.error("Failed to send message", e);
       }
@@ -250,21 +260,19 @@ async function onMessage(message: unknown) {
 function createReceiverConnection() {
   const receiverConnection = new RTCPeerConnection(rtcConfiguration);
 
-  receiverConnection.onicecandidate = function (e) {
+  receiverConnection.onicecandidate = async function (e) {
     console.log(e);
     if (e.candidate == null) {
-      writeSharedState(
+      await refreshState();
+      await writeSharedState(
         updateClientState(getState(), {
-          id: clientId,
-          lastSeen: Date.now(),
-          name: clientId,
+          ...clientState.value,
           answers: [
             {
               value: JSON.stringify(receiverConnection.localDescription),
               targetClientId: offerClientId.value!,
             },
           ],
-          offers: [],
         }),
       );
     }
