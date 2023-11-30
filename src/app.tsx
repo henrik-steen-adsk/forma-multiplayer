@@ -5,7 +5,7 @@ import { useCallback } from "preact/hooks";
 
 const storageSchemaVersion = 3;
 
-const offerClientId = signal<string | undefined>(undefined)
+const offerClientId = signal<string | undefined>(undefined);
 const clientId = crypto.randomUUID();
 
 type SharedState = {
@@ -103,33 +103,71 @@ async function writeSharedState(updated: SharedState) {
 const rtcConfiguration = {
   iceServers: [{ urls: "stun:stun.gmx.net" }],
 };
-const presenterConnection = new RTCPeerConnection(rtcConfiguration);
 
-presenterConnection.onicecandidate = function (e) {
-  if (e.candidate == null) {
-    console.log("presenterConnection.onicecandidate", e);
-    writeSharedState(
-      updateClientState(
-        {
-          ...getState(),
-          leaderClientId: clientId,
-        },
-        {
-          id: clientId,
-          lastSeen: Date.now(),
-          name: clientId,
-          answers: [],
-          offers: [
-            {
-              value: JSON.stringify(presenterConnection.localDescription),
-              targetClientId: "TODO",
-            },
-          ],
-        },
-      ),
+const presenterDataChannels: RTCDataChannel[] = [];
+
+function createPresenterConnection() {
+  const presenterConnection = new RTCPeerConnection(rtcConfiguration);
+
+  presenterConnection.onicecandidate = function (e) {
+    if (e.candidate == null) {
+      console.log("presenterConnection.onicecandidate", e);
+      writeSharedState(
+        updateClientState(
+          {
+            ...getState(),
+            leaderClientId: clientId,
+          },
+          {
+            id: clientId,
+            lastSeen: Date.now(),
+            name: clientId,
+            answers: [],
+            offers: [
+              {
+                value: JSON.stringify(presenterConnection.localDescription),
+                targetClientId: "TODO",
+              },
+            ],
+          },
+        ),
+      );
+    }
+  };
+
+  const presenterDataChannel = presenterConnection.createDataChannel("test", {});
+  presenterDataChannel.onopen = function (e) {
+    console.log("presenter connection open", e);
+  };
+  presenterDataChannel.onmessage = function (e) {
+    console.log(e);
+    if (e.data.charCodeAt(0) == 2) {
+      return;
+    }
+    var data = JSON.parse(e.data);
+    console.log(data);
+  };
+
+  presenterDataChannels.push(presenterDataChannel);
+
+  effect(() => {
+    const answers = getState().clients.flatMap((client) =>
+      client.answers.filter((answer) => answer.targetClientId === clientId),
     );
-  }
-};
+    const firstAnswer = answers[0];
+
+    // Don't do anything if there is no answer matching the offer
+    if (!firstAnswer) {
+      return;
+    }
+    console.log("setting remote description answer");
+    var answerDesc = new RTCSessionDescription(JSON.parse(firstAnswer.value));
+    presenterConnection.setRemoteDescription(answerDesc);
+    return;
+  });
+
+  return presenterConnection;
+}
 
 effect(async () => {
   while (getState().leaderClientId === clientId) {
@@ -150,7 +188,13 @@ function sendCameraPosition(cameraPosition: CameraState) {
     cameraPosition,
   };
   if (getState().leaderClientId === clientId) {
-    presenterDataChannel.send(JSON.stringify(message));
+    for (const presenterDataChannel of presenterDataChannels) {
+      try {
+        presenterDataChannel.send(JSON.stringify(message));
+      } catch (e) {
+        console.error("Failed to send message", e);
+      }
+    }
   }
 }
 
@@ -180,19 +224,6 @@ async function onMessage(message: unknown) {
       break;
   }
 }
-
-const presenterDataChannel = presenterConnection.createDataChannel("test", {});
-presenterDataChannel.onopen = function (e) {
-  console.log("presenter connection open", e);
-};
-presenterDataChannel.onmessage = function (e) {
-  console.log(e);
-  if (e.data.charCodeAt(0) == 2) {
-    return;
-  }
-  var data = JSON.parse(e.data);
-  console.log(data);
-};
 
 const receiverConnection = new RTCPeerConnection(rtcConfiguration);
 
@@ -230,6 +261,7 @@ receiverConnection.ondatachannel = function (e) {
 
 export default function App() {
   const createAndStoreOffer = useCallback(() => {
+    const presenterConnection = createPresenterConnection();
     presenterConnection.createOffer(
       function (desc) {
         presenterConnection.setLocalDescription(
@@ -243,22 +275,6 @@ export default function App() {
     );
   }, []);
 
-  useSignalEffect(() => {
-    const answers = getState().clients.flatMap((client) =>
-      client.answers.filter((answer) => answer.targetClientId === clientId),
-    );
-    const firstAnswer = answers[0];
-
-    // Don't do anything if there is no answer matching the offer
-    if (!firstAnswer) {
-      return;
-    }
-    console.log("setting remote description answer");
-    var answerDesc = new RTCSessionDescription(JSON.parse(firstAnswer.value));
-    presenterConnection.setRemoteDescription(answerDesc);
-    return;
-  });
-
   const connectToOffer = () => {
     const state = getState();
     const leader = state.clients.find((client) => client.id === state.leaderClientId);
@@ -266,7 +282,7 @@ export default function App() {
 
     if (leader == null || offer == null || leader.id === clientId) return;
 
-    offerClientId.value = leader.id
+    offerClientId.value = leader.id;
 
     receiverConnection.setRemoteDescription(JSON.parse(offer.value));
     receiverConnection.createAnswer(
