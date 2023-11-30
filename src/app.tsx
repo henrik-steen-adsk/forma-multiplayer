@@ -207,7 +207,7 @@ effect(async () => {
     } catch (e) {
       console.error("Failed while sharing", e);
     }
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await new Promise((resolve) => setTimeout(resolve, 150));
   }
 });
 
@@ -251,6 +251,7 @@ async function onMessage(message: unknown) {
       await Forma.camera.move({
         position: message.cameraPosition.position,
         target: message.cameraPosition.target,
+        transitionTimeMs: 100,
       });
       break;
   }
