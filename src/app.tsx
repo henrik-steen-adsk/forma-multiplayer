@@ -70,7 +70,6 @@ const storageKey = "state";
 const storagePollingState = signal<"initialize" | "idle" | "loading" | "failed">("initialize");
 const storageWriteState = signal<"idle" | "writing" | "failed">("idle");
 const storageState = signal<SharedState | undefined>(undefined);
-const isSharing = signal<boolean>(false);
 
 type Message = {
   type: "cameraPosition";
@@ -281,7 +280,7 @@ function createReceiverConnection() {
   receiverConnection.ondatachannel = function (e) {
     var datachannel = e.channel || e;
     const dc2 = datachannel;
-    dc2.onopen = function (e) {
+    dc2.onopen = function () {
       console.log("receiver connection open");
     };
     dc2.onmessage = function (e) {
