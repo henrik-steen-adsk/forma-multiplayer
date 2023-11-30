@@ -103,7 +103,7 @@ function isMessage(data: unknown): data is Message {
   return data != null && typeof data === "object" && "type" in data;
 }
 
-function onMessage(message: unknown) {
+async function onMessage(message: unknown) {
   if (!isMessage(message)) {
     console.error("Unexpected message", message);
     return;
@@ -111,8 +111,14 @@ function onMessage(message: unknown) {
 
   switch (message.type) {
     case "cameraPosition":
-      // TODO: switch perspective
-      void Forma.camera.move({
+      const currentCameraState = await Forma.camera.getCurrent();
+      if (currentCameraState.type !== message.cameraPosition.type) {
+        // TODO: Should not use toggles for async operations.
+        await Forma.camera.switchPerspective();
+      }
+
+      // TODO: Would be nice with perspective as part of this API call.
+      await Forma.camera.move({
         position: message.cameraPosition.position,
         target: message.cameraPosition.target,
       });
