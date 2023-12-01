@@ -5,13 +5,6 @@ import { useCallback } from "preact/hooks";
 import pLimit from "p-limit";
 import equal from "fast-deep-equal";
 
-const fetchLimit = pLimit(1);
-
-const storageSchemaVersion = 8;
-
-const connectedLeaderClientId = signal<string | undefined>(undefined);
-const clientId = crypto.randomUUID();
-
 type SharedState = {
   schemaVersion: typeof storageSchemaVersion;
   clients: {
@@ -30,29 +23,33 @@ type SharedState = {
   leaderClientId: string | undefined;
 };
 
-const clientState = signal<SharedState["clients"][0]>(createClientState());
+const fetchLimit = pLimit(1);
 
-function getState(): SharedState {
-  return storageState.value ?? createBlankState();
-}
+const clientId = crypto.randomUUID();
+const clientState = signal<SharedState["clients"][0]>({
+  id: clientId,
+  lastSeen: Date.now(),
+  name: clientId.slice(0, 8),
+  answers: [],
+  offers: [],
+});
 
-function createBlankState(): SharedState {
-  return {
-    schemaVersion: storageSchemaVersion,
-    clients: [],
-    leaderClientId: undefined,
-  };
-}
+const storageSchemaVersion = 8;
+const storageKey = "state";
+const storagePollingState = signal<"initialize" | "idle" | "loading" | "failed">("initialize");
+const storageWriteState = signal<"idle" | "writing" | "failed">("idle");
+const storageState = signal<SharedState>({
+  schemaVersion: storageSchemaVersion,
+  clients: [],
+  leaderClientId: undefined,
+});
 
-function createClientState(): SharedState["clients"][0] {
-  return {
-    id: clientId,
-    lastSeen: Date.now(),
-    name: clientId.slice(0, 8),
-    answers: [],
-    offers: [],
-  };
-}
+const rtcConfiguration = {
+  iceServers: [{ urls: "stun:stun.gmx.net" }],
+};
+const dataChannels = new Map<string, RTCDataChannel>();
+const connectedLeaderClientId = signal<string | undefined>(undefined);
+const clientsSettingUp = new Set<string>();
 
 function updateClientState(updated?: Partial<SharedState["clients"][0]>) {
   clientState.value = {
@@ -61,17 +58,10 @@ function updateClientState(updated?: Partial<SharedState["clients"][0]>) {
     lastSeen: Date.now(),
   };
   storageState.value = {
-    ...getState(),
-    clients: [...getOtherClients(getState()), clientState.value].sort((a, b) =>
-      a.id.localeCompare(b.id),
-    ),
+    ...storageState.value,
+    clients: getClientsState(),
   };
 }
-
-const storageKey = "state";
-const storagePollingState = signal<"initialize" | "idle" | "loading" | "failed">("initialize");
-const storageWriteState = signal<"idle" | "writing" | "failed">("idle");
-const storageState = signal<SharedState | undefined>(undefined);
 
 type Message =
   | {
@@ -88,7 +78,7 @@ startStoragePolling();
 async function refreshState(override?: Partial<SharedState>) {
   if (override) {
     storageState.value = {
-      ...getState(),
+      ...storageState.value,
       ...override,
     };
   }
@@ -102,7 +92,7 @@ async function refreshState(override?: Partial<SharedState>) {
 
         // Ignore old versioned state.
         if (parsed.schemaVersion === storageSchemaVersion) {
-          console.log("got data", parsed);
+          console.log("Got updated state", parsed);
           storageState.value = {
             ...parsed,
             ...override,
@@ -121,7 +111,9 @@ async function refreshState(override?: Partial<SharedState>) {
 async function startStoragePolling() {
   while (true) {
     await refreshState();
-    const persistedClientState = getState().clients.find((client) => client.id === clientId);
+    const persistedClientState = storageState.value.clients.find(
+      (client) => client.id === clientId,
+    );
     if (
       persistedClientState == null ||
       persistedClientState.lastSeen < Date.now() - 15000 ||
@@ -133,25 +125,24 @@ async function startStoragePolling() {
   }
 }
 
-function getOtherClients(state: SharedState) {
-  return state.clients.filter(
+function getClientsState() {
+  const otherClients = storageState.value.clients.filter(
     (client) => client.id !== clientId && client.lastSeen >= Date.now() - 20000,
   );
+
+  return [...otherClients, clientState.value].sort((a, b) => a.id.localeCompare(b.id));
 }
 
 async function writeSharedState(update?: Partial<SharedState>) {
   try {
     updateClientState();
-    const prev = getState();
     storageWriteState.value = "writing";
     storageState.value = {
-      ...prev,
-      clients: [...getOtherClients(prev), clientState.value].sort((a, b) =>
-        a.id.localeCompare(b.id),
-      ),
+      ...storageState.value,
+      clients: getClientsState(),
       ...update,
     };
-    console.log("save state", storageState.value);
+    console.log("Save new state", storageState.value);
     await Forma.extensions.storage.setObject({
       key: storageKey,
       data: JSON.stringify(storageState.value),
@@ -164,60 +155,52 @@ async function writeSharedState(update?: Partial<SharedState>) {
   }
 }
 
-const rtcConfiguration = {
-  iceServers: [{ urls: "stun:stun.gmx.net" }],
-};
-
-const answeredClientIds: string[] = [];
-
-const presenterDataChannels: RTCDataChannel[] = [];
-
 async function createPresenterConnection(targetClientId: string) {
-  console.log("createPresenterConnection", targetClientId);
-  const presenterConnection = new RTCPeerConnection(rtcConfiguration);
+  console.log(`Create connection towards ${targetClientId}`);
 
-  const presenterDataChannel = presenterConnection.createDataChannel("test", {});
-  presenterDataChannel.onopen = function (e) {
-    console.log("presenter connection open", e);
+  const connection = new RTCPeerConnection(rtcConfiguration);
+
+  const dataChannel = connection.createDataChannel("main");
+  dataChannel.onopen = (e) => {
+    console.log(`Presenter's data channel to viewer ${targetClientId} open`, e);
   };
-  presenterDataChannel.onmessage = function (e) {
-    console.log(e);
-    if (e.data.charCodeAt(0) == 2) {
+  dataChannel.onmessage = (e) => {
+    console.warn("Unexpected message on presenter", e);
+  };
+  dataChannels.set(targetClientId, dataChannel);
+
+  // Listen for connection answer.
+  const cleanup = effect(() => {
+    if (dataChannels.get(targetClientId) !== dataChannel) {
+      cleanup();
       return;
     }
-    var data = JSON.parse(e.data);
-    console.log(data);
-  };
 
-  presenterDataChannels.push(presenterDataChannel);
+    const targetClient = storageState.value.clients.find((client) => client.id === targetClientId);
+    if (!targetClient) return;
 
-  effect(() => {
-    const answers = getState()
-      .clients.filter((client) => client.id === targetClientId)
-      .flatMap((client) =>
-        client.answers
-          .filter((answer) => answer.targetClientId === clientId)
-          .map((answer) => ({
-            answer,
-            client,
-          })),
-      );
+    const answer = targetClient.answers.find((answer) => answer.targetClientId === clientId);
+    if (!answer) return;
 
-    for (const { answer, client } of answers) {
-      if (answeredClientIds.includes(client.id)) continue;
-      console.log("setting remote description answer");
-      var answerDesc = new RTCSessionDescription(JSON.parse(answer.value));
-      presenterConnection.setRemoteDescription(answerDesc);
-      answeredClientIds.push(client.id);
-    }
+    console.log(`Got answer from ${targetClientId}`);
+    connection.setRemoteDescription(new RTCSessionDescription(JSON.parse(answer.value)));
+
+    cleanup();
   });
 
-  const offer = await presenterConnection.createOffer();
-  presenterConnection.setLocalDescription(offer);
+  connection.setLocalDescription();
 
-  return {
-    offer,
-  };
+  return new Promise<{ offer: RTCSessionDescriptionInit }>(async (resolve) => {
+    connection.onicecandidate = async (e) => {
+      // Check if all ICE gathering completed.
+      if (e.candidate == null) {
+        console.log(`Got all candidates for ${targetClientId}`, {
+          localDescription: connection.localDescription!.sdp,
+        });
+        resolve({ offer: connection.localDescription! });
+      }
+    };
+  });
 }
 
 let lastSentCameraPosition:
@@ -285,7 +268,7 @@ async function startSelectionSending(sender: symbol) {
 }
 
 effect(() => {
-  const shouldBeSending = getState().leaderClientId === clientId;
+  const shouldBeSending = storageState.value.leaderClientId === clientId;
   if (!shouldBeSending && activeSender) {
     activeSender = undefined;
   }
@@ -297,9 +280,11 @@ effect(() => {
 });
 
 function broadcast(message: Message) {
-  console.log("send", message);
+  if (dataChannels.size === 0) return;
+
+  console.log("Send message", message);
   const serialized = JSON.stringify(message);
-  for (const channel of presenterDataChannels) {
+  for (const channel of dataChannels.values()) {
     try {
       if (channel.readyState === "open") {
         channel.send(serialized);
@@ -370,41 +355,41 @@ async function onMessage(message: unknown) {
   }
 }
 
-function createReceiverConnection() {
+async function createViewerConnection(targetClientId: string, offer: RTCSessionDescriptionInit) {
+  console.log(`Create connection (answer) towards ${targetClientId}`, { offer });
+
   const connection = new RTCPeerConnection(rtcConfiguration);
 
-  connection.onicecandidate = async function (e) {
-    if (e.candidate == null) {
-      await refreshState();
-      updateClientState({
-        answers: [
-          {
-            value: JSON.stringify(connection.localDescription),
-            targetClientId: connectedLeaderClientId.value!,
-          },
-        ],
-      });
-      await writeSharedState();
-    }
-  };
+  connection.ondatachannel = (e) => {
+    console.log(`Got viewer's data channel to presenter ${targetClientId}`);
 
-  connection.ondatachannel = function (e) {
     var datachannel = e.channel || e;
-    const dc2 = datachannel;
-    dc2.onopen = function () {
-      console.log("receiver connection open");
+    datachannel.onopen = () => {
+      console.log(`Viewer's data channel to presenter ${targetClientId} open`, e);
     };
-    dc2.onmessage = function (e) {
-      var data = JSON.parse(e.data);
-      onMessage(data);
+    datachannel.onmessage = (e) => {
+      onMessage(JSON.parse(e.data));
     };
   };
 
-  return connection;
+  connection.setRemoteDescription(offer);
+  connection.setLocalDescription();
+
+  return new Promise<{ answer: RTCSessionDescriptionInit }>(async (resolve) => {
+    connection.onicecandidate = async (e) => {
+      // Check if all ICE gathering completed.
+      if (e.candidate == null) {
+        console.log(`Got all candidates for ${targetClientId}`, {
+          localDescription: connection.localDescription!.sdp,
+        });
+        resolve({ answer: connection.localDescription! });
+      }
+    };
+  });
 }
 
 effect(async () => {
-  const state = getState();
+  const state = storageState.value;
 
   const leader = state.clients.find((client) => client.id === state.leaderClientId);
   if (!leader) return;
@@ -415,53 +400,75 @@ effect(async () => {
   if (connectedLeaderClientId.value == leader.id) return;
   connectedLeaderClientId.value = leader.id;
 
-  const receiverConnection = createReceiverConnection();
-  receiverConnection.setRemoteDescription(JSON.parse(offer.value));
-  receiverConnection.setLocalDescription(await receiverConnection.createAnswer());
-});
-
-async function addClientsForLeader(clients: SharedState["clients"] = []) {
-  const offers: SharedState["clients"][0]["offers"] = [];
-  for (const client of clients) {
-    console.log("Add client", client.id);
-
-    const { offer } = await createPresenterConnection(client.id);
-    offers.push({
-      value: JSON.stringify(offer),
-      targetClientId: client.id,
-    });
-  }
+  const { answer } = await createViewerConnection(leader.id, JSON.parse(offer.value));
 
   updateClientState({
-    ...clientState.value,
-    offers: [...clientState.value.offers, ...offers],
+    answers: [
+      ...clientState.value.answers.filter((it) => it.targetClientId !== leader.id),
+      {
+        value: JSON.stringify(answer),
+        targetClientId: leader.id,
+      },
+    ],
   });
+  await refreshState();
+  await writeSharedState();
+});
+
+async function flagAsLeaderAndAddClients(clients: SharedState["clients"] = []) {
+  for (const client of clients) {
+    clientsSettingUp.add(client.id);
+  }
 
   await refreshState({
     leaderClientId: clientId,
   });
   await writeSharedState();
+
+  await Promise.allSettled(
+    clients.map((client) =>
+      (async () => {
+        const { offer } = await createPresenterConnection(client.id);
+
+        updateClientState({
+          ...clientState.value,
+          offers: [
+            ...clientState.value.offers.filter((it) => it.targetClientId !== client.id),
+            {
+              value: JSON.stringify(offer),
+              targetClientId: client.id,
+            },
+          ],
+        });
+
+        clientsSettingUp.delete(client.id);
+      })(),
+    ),
+  );
 }
 
+// Add late viewers.
 effect(() => {
-  if (getState().leaderClientId !== clientId) return;
+  if (storageState.value.leaderClientId !== clientId) return;
 
   const existingOffersTo = clientState.value.offers.map((offer) => offer.targetClientId);
-
-  const clients = getState().clients.filter(
-    (client) => client.id !== clientId && !existingOffersTo.includes(client.id),
+  const clients = storageState.value.clients.filter(
+    (client) =>
+      client.id !== clientId &&
+      !existingOffersTo.includes(client.id) &&
+      !clientsSettingUp.has(client.id),
   );
 
   if (clients.length > 0) {
-    addClientsForLeader(clients);
+    flagAsLeaderAndAddClients(clients);
   }
 });
 
 const showDebug = signal<boolean>(false);
 
 function startPresent() {
-  const clients = getState().clients.filter((client) => client.id !== clientId);
-  addClientsForLeader(clients);
+  const clients = storageState.value.clients.filter((client) => client.id !== clientId);
+  flagAsLeaderAndAddClients(clients);
 }
 
 export default function App() {
@@ -478,15 +485,15 @@ export default function App() {
             });
           }}
         />
-        {getState().leaderClientId !== clientId && (
+        {storageState.value.leaderClientId !== clientId && (
           <weave-button onClick={startPresent} style="margin-left: 12px">
             Present
           </weave-button>
         )}
       </p>
-      {getState().leaderClientId === clientId && <p>You are presenting!</p>}
+      {storageState.value.leaderClientId === clientId && <p>You are presenting!</p>}
       <p>Participants:</p>
-      {getState().clients.map((client) => (
+      {storageState.value.clients.map((client) => (
         <p>
           {client.name} {client.id === clientId && <> (you)</>}
         </p>
