@@ -492,12 +492,15 @@ export default function App() {
         )}
       </p>
       {storageState.value.leaderClientId === clientId && <p>You are presenting!</p>}
-      <p>Participants:</p>
-      {storageState.value.clients.map((client) => (
-        <p>
-          {client.name} {client.id === clientId && <> (you)</>}
-        </p>
-      ))}
+      <p>Other participants:</p>
+      {storageState.value.clients
+        .filter((client) => client.id !== clientId)
+        .map((client) => (
+          <p>
+            {client.name}
+            {client.id === connectedLeaderClientId.value && <> (presenter)</>}
+          </p>
+        ))}
       <p>
         <weave-button onClick={() => (showDebug.value = !showDebug.value)}>Debug</weave-button>
       </p>
